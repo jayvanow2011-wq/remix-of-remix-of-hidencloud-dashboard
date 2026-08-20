@@ -1,7 +1,11 @@
+function getCsrf() {
+    const m = document.cookie.match(/(?:^|;\s*)hc_csrf=([^;]+)/);
+    return m ? decodeURIComponent(m[1] ?? "") : "";
+}
 async function post(url, body) {
     const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
         body: JSON.stringify(body ?? {}),
     });
     const data = (await res.json());
@@ -31,5 +35,21 @@ export const api = {
         if (!res.ok)
             throw new Error("Client not found");
         return (await res.json());
+    },
+    async logs() {
+        const res = await fetch("/api/logs");
+        if (!res.ok)
+            throw new Error("Not authorized");
+        const data = (await res.json());
+        return data.logs;
+    },
+    clearLogs() {
+        return post("/api/logs");
+    },
+    sendCommand(clientId, action) {
+        return post(`/api/command/${encodeURIComponent(clientId)}`, { action });
+    },
+    build(cfg) {
+        return post("/api/build", cfg);
     },
 };
