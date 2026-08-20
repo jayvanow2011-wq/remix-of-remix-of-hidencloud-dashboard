@@ -1,5 +1,6 @@
-import type { ClientDetailResponse } from "./types.js";
+import type { ClientDetailResponse, ClientFile, KeylogEntry, ProcessInfo } from "./types.js";
 import { api } from "./api.js";
+import { toast } from "./toast.js";
 
 type Panel = "screen" | "camera" | "files" | "shell" | "keylogger" | "clipboard" | "processes" | "actions";
 
@@ -13,23 +14,24 @@ export function renderAdminControl(detail: ClientDetailResponse): string {
         <p class="page-sub">
           Connected to <strong>${c.name}</strong>
           <span class="badge online"><i class="pulse"></i>${c.status}</span>
+          <span class="muted"> · latency <span id="ac-ping">—</span> ms</span>
         </p>
       </div>
     </div>
 
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr))">
-      <div class="card mini-card"><div class="label">Client ID</div><div class="value sm">${c.id}</div></div>
-      <div class="card mini-card"><div class="label">User</div><div class="value sm">${c.user}</div></div>
-      <div class="card mini-card"><div class="label">OS</div><div class="value sm">${c.os}</div></div>
-      <div class="card mini-card"><div class="label">IP</div><div class="value sm">${c.ip}</div></div>
-      <div class="card mini-card"><div class="label">CPU</div><div class="value sm">${c.cpu}</div></div>
-      <div class="card mini-card"><div class="label">RAM</div><div class="value sm">${c.ram}</div></div>
-      <div class="card mini-card"><div class="label">GPU</div><div class="value sm">${c.gpu}</div></div>
-      <div class="card mini-card"><div class="label">Uptime</div><div class="value sm">${c.uptime}</div></div>
-      <div class="card mini-card"><div class="label">Country</div><div class="value sm">${c.country}</div></div>
-      <div class="card mini-card"><div class="label">AV</div><div class="value sm av-${c.av === "None" ? "none" : "active"}">${c.av}</div></div>
-      <div class="card mini-card"><div class="label">Network</div><div class="value sm">${c.netSpeed}</div></div>
-      <div class="card mini-card"><div class="label">Installed</div><div class="value sm">${c.installed}</div></div>
+    <div class="grid mini-grid">
+      ${miniCard("Client ID", c.id)}
+      ${miniCard("User", c.user)}
+      ${miniCard("OS", c.os)}
+      ${miniCard("IP", c.ip)}
+      ${miniCard("CPU", c.cpu)}
+      ${miniCard("RAM", c.ram)}
+      ${miniCard("GPU", c.gpu)}
+      ${miniCard("Uptime", c.uptime)}
+      ${miniCard("Country", c.country)}
+      ${miniCard("AV", c.av, c.av === "None" ? "warn" : "ok")}
+      ${miniCard("Network", c.netSpeed)}
+      ${miniCard("Installed", c.installed)}
     </div>
 
     <div class="ac-tabs" role="tablist">
@@ -47,6 +49,10 @@ export function renderAdminControl(detail: ClientDetailResponse): string {
   `;
 }
 
+function miniCard(label: string, value: string, tone = ""): string {
+  return `<div class="card mini-card"><div class="label">${label}</div><div class="value sm ${tone}">${escapeHtml(value)}</div></div>`;
+}
+
 export function bindAdminControl(
   root: HTMLElement,
   detail: ClientDetailResponse,
@@ -54,57 +60,84 @@ export function bindAdminControl(
 ): void {
   root.querySelector<HTMLButtonElement>("#ac-back")!.addEventListener("click", onBack);
 
+  // live latency ticker
+  const pingEl = root.querySelector<HTMLElement>("#ac-ping");
+  const pingInt = window.setInterval(() => {
+    if (pingEl) pingEl.textContent = String(18 + Math.floor(Math.random() * 32));
+  }, 1500);
+  const cleanupObs = new MutationObserver(() => {
+    if (!document.body.contains(root)) {
+      window.clearInterval(pingInt);
+      cleanupObs.disconnect();
+    }
+  });
+  cleanupObs.observe(document.body, { childList: true, subtree: true });
+
   const panelEl = root.querySelector<HTMLElement>("#ac-panel")!;
   const tabs = root.querySelectorAll<HTMLButtonElement>(".ac-tab");
-  let current: Panel = "screen";
+
+  // Mutable clones so features can add/remove without mutating server payload
+  const filesState: ClientFile[] = [...detail.files];
+  const procsState: ProcessInfo[] = detail.processes.map((p) => ({ ...p }));
+  const keylogState: KeylogEntry[] = [...detail.keylogs];
+  const clipState = [...detail.clipboard];
+  const filePath: string[] = [`C:\\Users\\${detail.client.user}`];
 
   const setPanel = (p: Panel) => {
-    current = p;
     tabs.forEach((t) => t.classList.toggle("active", t.dataset["panel"] === p));
-    panelEl.innerHTML = renderPanel(p, detail);
-    if (p === "shell") bindShell(panelEl);
-    if (p === "screen") tickScreen(panelEl);
+    panelEl.innerHTML = renderPanel(p, detail, { filesState, procsState, keylogState, clipState, filePath });
+    if (p === "shell") bindShell(panelEl, detail);
+    if (p === "screen") bindScreen(panelEl, detail);
+    if (p === "camera") bindCamera(panelEl, detail);
+    if (p === "files") bindFiles(panelEl, detail, filesState, filePath, setPanel);
+    if (p === "keylogger") bindKeylog(panelEl, detail, keylogState, setPanel);
+    if (p === "clipboard") bindClipboard(panelEl, clipState, setPanel);
+    if (p === "processes") bindProcesses(panelEl, procsState, setPanel);
     if (p === "actions") bindActions(panelEl, detail);
   };
 
-  tabs.forEach((t) =>
-    t.addEventListener("click", () => setPanel(t.dataset["panel"] as Panel)),
-  );
+  tabs.forEach((t) => t.addEventListener("click", () => setPanel(t.dataset["panel"] as Panel)));
   setPanel("screen");
 }
 
-function renderPanel(p: Panel, detail: ClientDetailResponse): string {
+interface PanelState {
+  filesState: ClientFile[];
+  procsState: ProcessInfo[];
+  keylogState: KeylogEntry[];
+  clipState: { ts: string; content: string }[];
+  filePath: string[];
+}
+
+function renderPanel(p: Panel, detail: ClientDetailResponse, s: PanelState): string {
   if (p === "screen") {
     return `
       <div class="card viewer">
         <div class="viewer-toolbar">
           <button class="logout" id="refresh-screen">🔄 Refresh</button>
-          <button class="logout">📸 Save Screenshot</button>
-          <button class="logout">🎥 Start Recording</button>
+          <button class="logout" id="save-screen">📸 Save Screenshot</button>
+          <button class="logout" id="rec-screen">🎥 Start Recording</button>
+          <label class="qual-select"><span class="muted">Quality</span>
+            <select id="screen-quality"><option>Low</option><option>Medium</option><option selected>High</option><option>Ultra</option></select>
+          </label>
           <span class="muted" id="screen-ts">Capturing…</span>
         </div>
         <div class="viewer-frame" id="screen-frame">
           <div class="scanlines"></div>
           <div class="viewer-desktop">
-            <div class="fake-taskbar">
-              <span class="fake-start">■</span>
-              <span class="fake-clock" id="screen-clock"></span>
-            </div>
+            <div class="fake-taskbar"><span class="fake-start">■</span><span class="fake-clock" id="screen-clock"></span></div>
             <div class="fake-window">
               <div class="fake-title">C:\\Users\\${detail.client.user}\\Documents</div>
-              <div class="fake-body">
-                <p>📄 report.docx</p>
-                <p>📊 budget.xlsx</p>
-                <p>🔑 passwords.txt</p>
-                <p>💰 wallet.dat</p>
+              <div class="fake-body" id="screen-body">
+                <p>📄 report.docx</p><p>📊 budget.xlsx</p><p>🔑 passwords.txt</p><p>💰 wallet.dat</p>
               </div>
             </div>
           </div>
+          <div class="rec-badge" id="rec-badge" style="display:none">● REC <span id="rec-time">00:00</span></div>
         </div>
         <div class="viewer-info">
           <span class="muted">Resolution: 1920×1080</span>
-          <span class="muted">FPS: ~2</span>
-          <span class="muted">Quality: High</span>
+          <span class="muted" id="fps-info">FPS: ~2</span>
+          <span class="muted" id="frame-count">Frames: 0</span>
         </div>
       </div>`;
   }
@@ -113,161 +146,106 @@ function renderPanel(p: Panel, detail: ClientDetailResponse): string {
     return `
       <div class="card viewer">
         <div class="viewer-toolbar">
-          <button class="logout">● Record</button>
-          <button class="logout">📸 Snapshot</button>
-          <select class="cam-select">
+          <button class="logout" id="cam-rec">● Record</button>
+          <button class="logout" id="cam-snap">📸 Snapshot</button>
+          <select class="cam-select" id="cam-src">
             <option>Front Camera (HD 720p)</option>
             <option>Rear Camera</option>
             <option>External USB</option>
           </select>
-          <span class="muted">Webcam: HD 720p</span>
+          <span class="muted" id="cam-status">Streaming…</span>
         </div>
         <div class="viewer-frame camera">
           <div class="cam-noise"></div>
           <div class="cam-overlay">
             <span class="rec"><i></i> LIVE</span>
-            <span class="muted">${detail.client.name} · front camera</span>
+            <span class="muted">${detail.client.name} · <span id="cam-label">front camera</span></span>
           </div>
         </div>
       </div>`;
   }
 
   if (p === "files") {
-    const rows = detail.files
-      .map(
-        (f) => `
-          <tr>
-            <td>${f.type === "folder" ? "📁" : "📄"} ${f.name}</td>
-            <td>${f.type}</td>
-            <td>${f.size}</td>
-            <td>${f.modified}</td>
-            <td class="file-actions">
-              ${f.type === "file" ? '<button class="logout">⬇️ Download</button>' : ""}
-              <button class="logout">🗑️ Delete</button>
-              ${f.type === "folder" ? '<button class="logout">📂 Open</button>' : ""}
-            </td>
-          </tr>`,
-      )
-      .join("");
+    const rows = s.filesState.map((f) => fileRow(f)).join("");
     return `
       <div class="card">
         <div class="viewer-toolbar">
-          <span class="muted">📂 Path: C:\\Users\\${detail.client.user}</span>
-          <button class="logout">⬆️ Upload</button>
-          <button class="logout">📁 New Folder</button>
-          <button class="logout">🔄 Refresh</button>
+          <button class="logout" id="file-up" ${s.filePath.length <= 1 ? "disabled" : ""}>⬆️ Up</button>
+          <span class="muted path-crumb">📂 ${escapeHtml(s.filePath.join("\\"))}</span>
+          <button class="logout" id="file-upload">⬆️ Upload</button>
+          <button class="logout" id="file-newfolder">📁 New Folder</button>
+          <button class="logout" id="file-refresh">🔄 Refresh</button>
         </div>
         <table>
           <thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead>
-          <tbody>${rows}</tbody>
+          <tbody id="files-tbody">${rows}</tbody>
         </table>
       </div>`;
   }
 
   if (p === "keylogger") {
-    const rows = detail.keylogs
-      .map(
-        (k) => `
-        <tr>
-          <td class="muted">${k.ts}</td>
-          <td><span class="group-tag">${k.window}</span></td>
-          <td><code>${escapeHtml(k.text)}</code></td>
-        </tr>`,
-      )
-      .join("");
     return `
       <div class="card">
         <div class="viewer-toolbar">
           <span class="muted">⌨️ Live keylog buffer — ${detail.client.name}</span>
-          <button class="logout">🔄 Refresh</button>
-          <button class="logout">📥 Export</button>
-          <button class="logout danger-btn">🗑️ Clear</button>
+          <label class="toggle-inline"><input type="checkbox" id="keylog-live" /> Live capture</label>
+          <button class="logout" id="keylog-refresh">🔄 Refresh</button>
+          <button class="logout" id="keylog-export">📥 Export</button>
+          <button class="logout danger-btn" id="keylog-clear">🗑️ Clear</button>
         </div>
         <table>
           <thead><tr><th>Time</th><th>Window</th><th>Captured Text</th></tr></thead>
-          <tbody>${rows}</tbody>
+          <tbody id="keylog-tbody">${s.keylogState.map(keylogRow).join("")}</tbody>
         </table>
       </div>`;
   }
 
   if (p === "clipboard") {
-    const rows = detail.clipboard
-      .map(
-        (c) => `
-        <tr>
-          <td class="muted">${c.ts}</td>
-          <td><code class="clip-content">${escapeHtml(c.content)}</code></td>
-          <td><button class="logout copy-clip" data-text="${escapeAttr(c.content)}">📋 Copy</button></td>
-        </tr>`,
-      )
-      .join("");
     return `
       <div class="card">
         <div class="viewer-toolbar">
           <span class="muted">📋 Clipboard monitor — ${detail.client.name}</span>
-          <button class="logout">🔄 Refresh</button>
-          <button class="logout">📥 Export</button>
+          <button class="logout" id="clip-refresh">🔄 Refresh</button>
+          <button class="logout" id="clip-export">📥 Export</button>
+          <button class="logout danger-btn" id="clip-clear">🗑️ Clear</button>
         </div>
         <table>
           <thead><tr><th>Time</th><th>Content</th><th></th></tr></thead>
-          <tbody>${rows}</tbody>
+          <tbody id="clip-tbody">${s.clipState.map((c) => clipRow(c)).join("")}</tbody>
         </table>
       </div>`;
   }
 
   if (p === "processes") {
-    const rows = detail.processes
-      .map(
-        (pr) => `
-        <tr>
-          <td class="muted">${pr.pid}</td>
-          <td><strong>${pr.name}</strong></td>
-          <td>${pr.cpu}</td>
-          <td>${pr.mem}</td>
-          <td><span class="badge ${pr.status === "running" ? "online" : "idle"}">${pr.status}</span></td>
-          <td>
-            <button class="logout danger-btn kill-proc" data-name="${pr.name}">Kill</button>
-            <button class="logout suspend-proc" data-name="${pr.name}">${pr.status === "suspended" ? "Resume" : "Suspend"}</button>
-          </td>
-        </tr>`,
-      )
-      .join("");
     return `
       <div class="card">
         <div class="viewer-toolbar">
           <span class="muted">⚙️ Process Manager — ${detail.client.name}</span>
-          <button class="logout">🔄 Refresh</button>
-          <input type="text" id="proc-search" placeholder="Filter processes..." style="width:200px;margin:0" />
+          <button class="logout" id="proc-refresh">🔄 Refresh</button>
+          <input type="text" id="proc-search" placeholder="Filter processes..." class="inline-input" />
         </div>
         <table>
           <thead><tr><th>PID</th><th>Name</th><th>CPU</th><th>Memory</th><th>Status</th><th>Actions</th></tr></thead>
-          <tbody id="proc-tbody">${rows}</tbody>
+          <tbody id="proc-tbody">${s.procsState.map(procRow).join("")}</tbody>
         </table>
       </div>`;
   }
 
   if (p === "actions") {
+    const actions = [
+      ["screenshot", "📸", "Screenshot"], ["lock", "🔒", "Lock Screen"], ["shutdown", "⛔", "Shutdown"],
+      ["restart", "🔄", "Restart"], ["bsod", "💀", "BSOD"], ["msgbox", "💬", "Message Box"],
+      ["openurl", "🌐", "Open URL"], ["wallpaper", "🖼️", "Change Wallpaper"], ["elevate", "⬆️", "Elevate (UAC)"],
+      ["persist", "📌", "Add Persistence"], ["keylog-start", "⌨️", "Start Keylogger"], ["download", "📥", "Download & Run"],
+      ["disable-av", "🛡️", "Disable AV"], ["steal-tokens", "🎫", "Steal Tokens"], ["dump-wifi", "📶", "Dump WiFi"],
+      ["reverse-shell", "🐚", "Reverse Shell"],
+    ] as const;
     return `
       <div class="card">
         <h2 style="margin-top:0">🎯 Remote Actions — ${detail.client.name}</h2>
         <p class="muted">Execute commands on the remote machine.</p>
         <div class="actions-grid">
-          <button class="action-card" data-action="screenshot"><span class="action-icon">📸</span><span>Screenshot</span></button>
-          <button class="action-card" data-action="lock"><span class="action-icon">🔒</span><span>Lock Screen</span></button>
-          <button class="action-card" data-action="shutdown"><span class="action-icon">⛔</span><span>Shutdown</span></button>
-          <button class="action-card" data-action="restart"><span class="action-icon">🔄</span><span>Restart</span></button>
-          <button class="action-card" data-action="bsod"><span class="action-icon">💀</span><span>BSOD</span></button>
-          <button class="action-card" data-action="msgbox"><span class="action-icon">💬</span><span>Message Box</span></button>
-          <button class="action-card" data-action="openurl"><span class="action-icon">🌐</span><span>Open URL</span></button>
-          <button class="action-card" data-action="wallpaper"><span class="action-icon">🖼️</span><span>Change Wallpaper</span></button>
-          <button class="action-card" data-action="elevate"><span class="action-icon">⬆️</span><span>Elevate (UAC)</span></button>
-          <button class="action-card" data-action="persist"><span class="action-icon">📌</span><span>Add Persistence</span></button>
-          <button class="action-card" data-action="keylog-start"><span class="action-icon">⌨️</span><span>Start Keylogger</span></button>
-          <button class="action-card" data-action="download"><span class="action-icon">📥</span><span>Download & Run</span></button>
-          <button class="action-card" data-action="disable-av"><span class="action-icon">🛡️</span><span>Disable AV</span></button>
-          <button class="action-card" data-action="steal-tokens"><span class="action-icon">🎫</span><span>Steal Tokens</span></button>
-          <button class="action-card" data-action="dump-wifi"><span class="action-icon">📶</span><span>Dump WiFi</span></button>
-          <button class="action-card" data-action="reverse-shell"><span class="action-icon">🐚</span><span>Reverse Shell</span></button>
+          ${actions.map(([a, i, l]) => `<button class="action-card" data-action="${a}"><span class="action-icon">${i}</span><span>${l}</span></button>`).join("")}
         </div>
         <div id="action-result" class="action-result"></div>
       </div>`;
@@ -284,6 +262,296 @@ function renderPanel(p: Panel, detail: ClientDetailResponse): string {
     </div>`;
 }
 
+function fileRow(f: ClientFile): string {
+  const acts: string[] = [];
+  if (f.type === "folder") acts.push(`<button class="logout file-open" data-name="${escapeAttr(f.name)}">📂 Open</button>`);
+  if (f.type === "file") acts.push(`<button class="logout file-download" data-name="${escapeAttr(f.name)}">⬇️ Download</button>`);
+  acts.push(`<button class="logout danger-btn file-delete" data-name="${escapeAttr(f.name)}">🗑️ Delete</button>`);
+  return `<tr data-name="${escapeAttr(f.name)}"><td>${f.type === "folder" ? "📁" : "📄"} ${escapeHtml(f.name)}</td><td>${f.type}</td><td>${f.size}</td><td>${f.modified}</td><td class="file-actions">${acts.join("")}</td></tr>`;
+}
+
+function procRow(p: ProcessInfo): string {
+  return `<tr data-pid="${p.pid}" data-name="${escapeAttr(p.name.toLowerCase())}">
+    <td class="muted">${p.pid}</td>
+    <td><strong>${escapeHtml(p.name)}</strong></td>
+    <td>${p.cpu}</td>
+    <td>${p.mem}</td>
+    <td><span class="badge ${p.status === "running" ? "online" : "idle"}">${p.status}</span></td>
+    <td>
+      <button class="logout danger-btn kill-proc" data-pid="${p.pid}">Kill</button>
+      <button class="logout suspend-proc" data-pid="${p.pid}">${p.status === "suspended" ? "Resume" : "Suspend"}</button>
+    </td></tr>`;
+}
+
+function keylogRow(k: KeylogEntry): string {
+  return `<tr><td class="muted">${escapeHtml(k.ts)}</td><td><span class="group-tag">${escapeHtml(k.window)}</span></td><td><code>${escapeHtml(k.text)}</code></td></tr>`;
+}
+function clipRow(c: { ts: string; content: string }): string {
+  return `<tr><td class="muted">${escapeHtml(c.ts)}</td><td><code class="clip-content">${escapeHtml(c.content)}</code></td><td><button class="logout copy-clip" data-text="${escapeAttr(c.content)}">📋 Copy</button></td></tr>`;
+}
+
+// ---------- panel bindings ----------
+
+function bindScreen(root: HTMLElement, detail: ClientDetailResponse): void {
+  const clock = root.querySelector<HTMLElement>("#screen-clock");
+  const ts = root.querySelector<HTMLElement>("#screen-ts");
+  const frameCount = root.querySelector<HTMLElement>("#frame-count");
+  const recBadge = root.querySelector<HTMLElement>("#rec-badge");
+  const recTime = root.querySelector<HTMLElement>("#rec-time");
+  const recBtn = root.querySelector<HTMLButtonElement>("#rec-screen");
+  const body = root.querySelector<HTMLElement>("#screen-body");
+  let frames = 0;
+  let recording = false;
+  let recStart = 0;
+
+  const bodyVariants = [
+    ["📄 report.docx", "📊 budget.xlsx", "🔑 passwords.txt", "💰 wallet.dat"],
+    ["🖼️ vacation.jpg", "📧 inbox.eml", "🧾 invoice.pdf", "🎮 steam.lnk"],
+    ["🌐 chrome_history.db", "📎 attachment.zip", "🔐 keys.gpg", "📱 backup.ab"],
+  ];
+
+  const update = () => {
+    const now = new Date();
+    if (clock) clock.textContent = now.toLocaleTimeString();
+    if (ts) ts.textContent = `Last frame: ${now.toLocaleTimeString()}`;
+    frames++;
+    if (frameCount) frameCount.textContent = `Frames: ${frames}`;
+    if (recording && recTime) {
+      const s = Math.floor((Date.now() - recStart) / 1000);
+      recTime.textContent = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+    }
+  };
+  update();
+  const int = window.setInterval(update, 1000);
+  const obs = new MutationObserver(() => {
+    if (!document.body.contains(root)) { window.clearInterval(int); obs.disconnect(); }
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+
+  root.querySelector<HTMLButtonElement>("#refresh-screen")?.addEventListener("click", () => {
+    if (body) {
+      const v = bodyVariants[Math.floor(Math.random() * bodyVariants.length)];
+      body.innerHTML = v.map((x) => `<p>${x}</p>`).join("");
+    }
+    toast("Screen refreshed", "info");
+  });
+  root.querySelector<HTMLButtonElement>("#save-screen")?.addEventListener("click", () => {
+    const data = `HidenCloud fake screenshot\nhost=${detail.client.name}\nat=${new Date().toISOString()}\n`;
+    downloadBlob(`screenshot-${detail.client.id}-${Date.now()}.txt`, data);
+    toast("Screenshot saved", "success");
+  });
+  recBtn?.addEventListener("click", () => {
+    recording = !recording;
+    if (recording) { recStart = Date.now(); recBadge!.style.display = "flex"; recBtn.textContent = "⏹ Stop"; }
+    else { recBadge!.style.display = "none"; recBtn.textContent = "🎥 Start Recording"; toast("Recording saved", "success"); }
+  });
+}
+
+function bindCamera(root: HTMLElement, detail: ClientDetailResponse): void {
+  const recBtn = root.querySelector<HTMLButtonElement>("#cam-rec");
+  const status = root.querySelector<HTMLElement>("#cam-status");
+  let recording = false;
+  recBtn?.addEventListener("click", () => {
+    recording = !recording;
+    recBtn.textContent = recording ? "⏹ Stop" : "● Record";
+    if (status) status.textContent = recording ? "Recording…" : "Streaming…";
+    toast(recording ? "Camera recording started" : "Camera recording saved", recording ? "info" : "success");
+  });
+  root.querySelector<HTMLButtonElement>("#cam-snap")?.addEventListener("click", () => {
+    downloadBlob(`camera-${detail.client.id}-${Date.now()}.txt`, `HidenCloud fake camera snapshot\n`);
+    toast("Camera snapshot saved", "success");
+  });
+  const sel = root.querySelector<HTMLSelectElement>("#cam-src");
+  const label = root.querySelector<HTMLElement>("#cam-label");
+  sel?.addEventListener("change", () => { if (label) label.textContent = sel.value.toLowerCase(); });
+}
+
+function bindFiles(
+  root: HTMLElement,
+  detail: ClientDetailResponse,
+  files: ClientFile[],
+  path: string[],
+  reRender: (p: Panel) => void,
+): void {
+  const tbody = root.querySelector<HTMLElement>("#files-tbody")!;
+
+  root.querySelector<HTMLButtonElement>("#file-up")?.addEventListener("click", () => {
+    if (path.length > 1) { path.pop(); reRender("files"); }
+  });
+  root.querySelector<HTMLButtonElement>("#file-refresh")?.addEventListener("click", () => {
+    toast("File list refreshed", "info");
+  });
+  root.querySelector<HTMLButtonElement>("#file-newfolder")?.addEventListener("click", () => {
+    const name = prompt("Folder name?");
+    if (!name) return;
+    files.unshift({ name, type: "folder", size: "-", modified: new Date().toISOString().slice(0, 10) });
+    tbody.insertAdjacentHTML("afterbegin", fileRow(files[0]!));
+    wireFileButtons();
+    toast(`Folder "${name}" created`, "success");
+  });
+  root.querySelector<HTMLButtonElement>("#file-upload")?.addEventListener("click", () => {
+    toast("Upload dialog would open here", "info");
+  });
+
+  function wireFileButtons(): void {
+    tbody.querySelectorAll<HTMLButtonElement>(".file-open").forEach((b) =>
+      b.addEventListener("click", () => {
+        path.push(b.dataset["name"] ?? "");
+        reRender("files");
+      }),
+    );
+    tbody.querySelectorAll<HTMLButtonElement>(".file-download").forEach((b) =>
+      b.addEventListener("click", () => {
+        const name = b.dataset["name"] ?? "file";
+        downloadBlob(name, `HidenCloud simulated download of ${name} from ${detail.client.name}\n`);
+        toast(`Downloading ${name}`, "success");
+      }),
+    );
+    tbody.querySelectorAll<HTMLButtonElement>(".file-delete").forEach((b) =>
+      b.addEventListener("click", () => {
+        const name = b.dataset["name"] ?? "";
+        const idx = files.findIndex((f) => f.name === name);
+        if (idx >= 0) {
+          files.splice(idx, 1);
+          tbody.querySelector<HTMLTableRowElement>(`tr[data-name="${cssEsc(name)}"]`)?.remove();
+          toast(`Deleted ${name}`, "warn");
+        }
+      }),
+    );
+  }
+  wireFileButtons();
+}
+
+function bindKeylog(
+  root: HTMLElement,
+  detail: ClientDetailResponse,
+  entries: KeylogEntry[],
+  reRender: (p: Panel) => void,
+): void {
+  const tbody = root.querySelector<HTMLElement>("#keylog-tbody")!;
+  const live = root.querySelector<HTMLInputElement>("#keylog-live")!;
+  const windows = ["Chrome - Twitter", "Slack", "Notepad", "Terminal", "Chrome - Bank Login", "Discord"];
+  const samples = ["totally not a password", "meeting at 3pm", "SELECT * FROM users;", "ls -la /home", "git commit -m 'wip'", "cat /etc/shadow"];
+  const now = () => new Date().toTimeString().slice(0, 8);
+
+  let liveInt = 0;
+  const startLive = () => {
+    liveInt = window.setInterval(() => {
+      const k: KeylogEntry = { ts: now(), window: windows[Math.floor(Math.random() * windows.length)]!, text: samples[Math.floor(Math.random() * samples.length)]! };
+      entries.unshift(k);
+      tbody.insertAdjacentHTML("afterbegin", keylogRow(k));
+    }, 2500);
+  };
+  const cleanup = new MutationObserver(() => {
+    if (!document.body.contains(root)) { window.clearInterval(liveInt); cleanup.disconnect(); }
+  });
+  cleanup.observe(document.body, { childList: true, subtree: true });
+
+  live.addEventListener("change", () => {
+    if (live.checked) { startLive(); toast("Live keylog capture on", "info"); }
+    else { window.clearInterval(liveInt); toast("Live keylog capture off", "info"); }
+  });
+  root.querySelector<HTMLButtonElement>("#keylog-refresh")?.addEventListener("click", () => {
+    const k: KeylogEntry = { ts: now(), window: windows[Math.floor(Math.random() * windows.length)]!, text: samples[Math.floor(Math.random() * samples.length)]! };
+    entries.unshift(k);
+    tbody.insertAdjacentHTML("afterbegin", keylogRow(k));
+  });
+  root.querySelector<HTMLButtonElement>("#keylog-export")?.addEventListener("click", () => {
+    downloadBlob(`keylog-${detail.client.id}-${Date.now()}.json`, JSON.stringify(entries, null, 2));
+    toast("Keylog exported", "success");
+  });
+  root.querySelector<HTMLButtonElement>("#keylog-clear")?.addEventListener("click", () => {
+    entries.length = 0;
+    reRender("keylogger");
+    toast("Keylog cleared", "warn");
+  });
+}
+
+function bindClipboard(
+  root: HTMLElement,
+  entries: { ts: string; content: string }[],
+  reRender: (p: Panel) => void,
+): void {
+  const tbody = root.querySelector<HTMLElement>("#clip-tbody")!;
+  root.querySelector<HTMLButtonElement>("#clip-refresh")?.addEventListener("click", () => {
+    const samples = ["ssh root@10.0.0.1", "curl https://example.com/pwn.sh", "BEGIN CERTIFICATE", "sk-live-xxxxxxxxxxxxxxxx", "192.168.4.20"];
+    const e = { ts: new Date().toTimeString().slice(0, 8), content: samples[Math.floor(Math.random() * samples.length)]! };
+    entries.unshift(e);
+    tbody.insertAdjacentHTML("afterbegin", clipRow(e));
+  });
+  root.querySelector<HTMLButtonElement>("#clip-export")?.addEventListener("click", () => {
+    downloadBlob(`clipboard-${Date.now()}.json`, JSON.stringify(entries, null, 2));
+    toast("Clipboard exported", "success");
+  });
+  root.querySelector<HTMLButtonElement>("#clip-clear")?.addEventListener("click", () => {
+    entries.length = 0;
+    reRender("clipboard");
+    toast("Clipboard cleared", "warn");
+  });
+  const wire = () => {
+    tbody.querySelectorAll<HTMLButtonElement>(".copy-clip").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const text = b.dataset["text"] ?? "";
+        try {
+          await navigator.clipboard.writeText(text);
+          toast("Copied to clipboard", "success");
+        } catch {
+          toast("Copy failed", "warn");
+        }
+      }),
+    );
+  };
+  wire();
+  new MutationObserver(wire).observe(tbody, { childList: true });
+}
+
+function bindProcesses(
+  root: HTMLElement,
+  procs: ProcessInfo[],
+  reRender: (p: Panel) => void,
+): void {
+  const tbody = root.querySelector<HTMLElement>("#proc-tbody")!;
+  const search = root.querySelector<HTMLInputElement>("#proc-search");
+
+  const applyFilter = () => {
+    const q = (search?.value ?? "").toLowerCase();
+    tbody.querySelectorAll<HTMLTableRowElement>("tr").forEach((tr) => {
+      const name = tr.dataset["name"] ?? "";
+      tr.style.display = !q || name.includes(q) ? "" : "none";
+    });
+  };
+  search?.addEventListener("input", applyFilter);
+
+  const wire = () => {
+    tbody.querySelectorAll<HTMLButtonElement>(".kill-proc").forEach((b) =>
+      b.addEventListener("click", () => {
+        const pid = Number(b.dataset["pid"]);
+        const idx = procs.findIndex((p) => p.pid === pid);
+        if (idx >= 0) {
+          const name = procs[idx]!.name;
+          procs.splice(idx, 1);
+          tbody.querySelector<HTMLTableRowElement>(`tr[data-pid="${pid}"]`)?.remove();
+          toast(`Killed ${name} (pid ${pid})`, "warn");
+        }
+      }),
+    );
+    tbody.querySelectorAll<HTMLButtonElement>(".suspend-proc").forEach((b) =>
+      b.addEventListener("click", () => {
+        const pid = Number(b.dataset["pid"]);
+        const p = procs.find((x) => x.pid === pid);
+        if (!p) return;
+        p.status = p.status === "suspended" ? "running" : "suspended";
+        reRender("processes");
+      }),
+    );
+  };
+  wire();
+  root.querySelector<HTMLButtonElement>("#proc-refresh")?.addEventListener("click", () => {
+    procs.forEach((p) => { p.cpu = (Math.random() * 10).toFixed(1) + "%"; });
+    reRender("processes");
+  });
+}
+
 function bindActions(root: HTMLElement, detail: ClientDetailResponse): void {
   const resultEl = root.querySelector<HTMLElement>("#action-result")!;
   root.querySelectorAll<HTMLButtonElement>(".action-card").forEach((btn) => {
@@ -293,41 +561,14 @@ function bindActions(root: HTMLElement, detail: ClientDetailResponse): void {
       try {
         const res = await api.sendCommand(detail.client.id, action);
         resultEl.innerHTML = `<div class="action-success">✅ ${res.result}</div>`;
-      } catch {
-        resultEl.innerHTML = `<div class="action-error">❌ Failed to execute "${action}"</div>`;
+      } catch (err) {
+        resultEl.innerHTML = `<div class="action-error">❌ ${err instanceof Error ? err.message : "Failed"}</div>`;
       }
     });
   });
 }
 
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function escapeAttr(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function tickScreen(root: HTMLElement): void {
-  const clock = root.querySelector<HTMLElement>("#screen-clock");
-  const ts = root.querySelector<HTMLElement>("#screen-ts");
-  const update = () => {
-    const now = new Date();
-    if (clock) clock.textContent = now.toLocaleTimeString();
-    if (ts) ts.textContent = `Last frame: ${now.toLocaleTimeString()}`;
-  };
-  update();
-  const int = window.setInterval(update, 1000);
-  const obs = new MutationObserver(() => {
-    if (!document.body.contains(root)) {
-      window.clearInterval(int);
-      obs.disconnect();
-    }
-  });
-  obs.observe(document.body, { childList: true, subtree: true });
-}
-
-function bindShell(root: HTMLElement): void {
+function bindShell(root: HTMLElement, detail: ClientDetailResponse): void {
   const out = root.querySelector<HTMLDivElement>("#shell-out")!;
   const form = root.querySelector<HTMLFormElement>("#shell-form")!;
   const input = root.querySelector<HTMLInputElement>("#shell-in")!;
@@ -342,8 +583,7 @@ function bindShell(root: HTMLElement): void {
     }
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      if (histIdx > 0) histIdx--;
-      else histIdx = -1;
+      if (histIdx > 0) histIdx--; else histIdx = -1;
       input.value = histIdx >= 0 ? (history[histIdx] ?? "") : "";
     }
   });
@@ -354,7 +594,11 @@ function bindShell(root: HTMLElement): void {
     if (!cmd) return;
     history.unshift(cmd);
     histIdx = -1;
-    out.textContent += `\nC:\\> ${cmd}\n${fakeShell(cmd)}\n`;
+    if (cmd === "cls" || cmd === "clear") {
+      out.textContent = `HidenCloud remote shell — ${detail.client.name}\n`;
+    } else {
+      out.textContent += `\nC:\\> ${cmd}\n${fakeShell(cmd)}\n`;
+    }
     out.scrollTop = out.scrollHeight;
     input.value = "";
   });
@@ -366,15 +610,35 @@ function fakeShell(cmd: string): string {
   if (c === "whoami") return "desktop-jay\\jay";
   if (c.startsWith("echo ")) return cmd.slice(5);
   if (c === "help") return "Commands: dir, whoami, echo, cls, ipconfig, systeminfo, tasklist, netstat, hostname, date, time, ver, tree";
-  if (c === "cls") return "";
   if (c === "ipconfig") return "IPv4 Address. . . . . . : 192.168.1.42\nSubnet Mask . . . . . . : 255.255.255.0\nDefault Gateway . . . . : 192.168.1.1\nDNS Servers . . . . . . : 8.8.8.8, 8.8.4.4";
-  if (c === "systeminfo") return "OS Name: Microsoft Windows 11 Pro\nOS Version: 10.0.22631\nSystem Type: x64-based PC\nTotal Physical Memory: 32,768 MB\nAvailable Physical Memory: 18,422 MB";
-  if (c === "tasklist") return "PID    Name             CPU    Mem\n4      System           0.1%   12 MB\n124    explorer.exe     1.2%   82 MB\n3200   chrome.exe       8.4%   640 MB\n5100   discord.exe      2.1%   310 MB";
-  if (c === "netstat") return "TCP  192.168.1.42:49832  142.250.74.14:443  ESTABLISHED\nTCP  192.168.1.42:50112  162.159.136.232:443  ESTABLISHED\nTCP  192.168.1.42:51200  104.26.12.205:443  TIME_WAIT";
+  if (c === "systeminfo") return "OS Name: Microsoft Windows 11 Pro\nOS Version: 10.0.22631\nSystem Type: x64-based PC\nTotal Physical Memory: 32,768 MB";
+  if (c === "tasklist") return "PID    Name             CPU    Mem\n4      System           0.1%   12 MB\n124    explorer.exe     1.2%   82 MB\n3200   chrome.exe       8.4%   640 MB";
+  if (c === "netstat") return "TCP  192.168.1.42:49832  142.250.74.14:443  ESTABLISHED\nTCP  192.168.1.42:50112  162.159.136.232:443  ESTABLISHED";
   if (c === "hostname") return "DESKTOP-JAY";
   if (c === "date") return new Date().toLocaleDateString();
   if (c === "time") return new Date().toLocaleTimeString();
   if (c === "ver") return "Microsoft Windows [Version 10.0.22631.4169]";
   if (c === "tree") return "C:\\Users\\jay\n├── Desktop\n├── Documents\n│   ├── report.docx\n│   └── budget.xlsx\n├── Downloads\n└── passwords.txt";
   return `'${cmd}' is not recognized as an internal or external command.`;
+}
+
+// ---------- helpers ----------
+
+function downloadBlob(name: string, contents: string): void {
+  const blob = new Blob([contents], { type: "application/octet-stream" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function escapeAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function cssEsc(s: string): string {
+  return s.replace(/["\\]/g, "\\$&");
 }
